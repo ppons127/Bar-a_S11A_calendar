@@ -1,6 +1,8 @@
 import asyncio
+import re
 from icalendar import Calendar
 from playwright.async_api import async_playwright
+
 
 FCF_URL = (
     "https://www.fcf.cat/ca/competicio"
@@ -16,6 +18,57 @@ TEAM = "BARCELONA, F.C."
 
 def clean(text):
     return " ".join(text.split()).strip()
+
+
+async def get_match_from_open_jornada(page, jornada, fecha):
+    spans = page.locator(f'span[title="{TEAM}"]')
+    count = await spans.count()
+
+    if count == 0:
+        return None
+
+    span = spans.first
+
+    current = span
+    row = None
+
+    # Subimos por el DOM hasta encontrar el contenedor
+    # que tiene exactamente dos nombres de equipo.
+    for _ in range(10):
+        current = current.locator("xpath=..")
+
+        titles = current.locator("span[title]")
+        n_titles = await titles.count()
+
+        if n_titles == 2:
+            row = current
+            break
+
+    if row is None:
+        return None
+
+    titles = row.locator("span[title]")
+
+    teams = []
+
+    for j in range(await titles.count()):
+        t = await titles.nth(j).get_attribute("title")
+
+        if t:
+            t = clean(t)
+
+            if t not in teams:
+                teams.append(t)
+
+    if len(teams) != 2:
+        return None
+
+    return {
+        "jornada": jornada,
+        "fecha": fecha,
+        "local": teams[0],
+        "visitante": teams[1],
+    }
 
 
 async def main():
@@ -34,143 +87,123 @@ async def main():
             timeout=90000
         )
 
-        await page.wait_for_selector(
-            f'span[title="{TEAM}"]',
-            timeout=90000
-        )
+        await page.wait_for_timeout(4000)
 
         print("Calendario cargado.")
 
-        # --------------------------------------------------
-        # FORZAR CARGA DE TODO EL CALENDARIO
-        # --------------------------------------------------
+        # Buscamos todos los encabezados "JORNADA X"
+        jornadas = page.get_by_text(
+            re.compile(r"^JORNADA\s+\d+$"),
+            exact=True
+        )
 
-        previous_height = 0
+        total_jornadas = await jornadas.count()
 
-        for _ in range(30):
-
-            current_height = await page.evaluate(
-                "document.body.scrollHeight"
-            )
-
-            await page.evaluate(
-                "window.scrollTo(0, document.body.scrollHeight)"
-            )
-
-            await page.wait_for_timeout(1200)
-
-            if current_height == previous_height:
-                break
-
-            previous_height = current_height
-
-        # Volvemos arriba
-        await page.evaluate("window.scrollTo(0, 0)")
-        await page.wait_for_timeout(1000)
-
-        print("Scroll completo realizado.")
-
-        # --------------------------------------------------
-        # BUSCAR TODOS LOS PARTIDOS
-        # --------------------------------------------------
-
-        all_spans = page.locator('span[title]')
-
-        count = await all_spans.count()
-
-        print(f"Elementos con title encontrados: {count}")
+        print(f"Jornadas encontradas: {total_jornadas}")
 
         matches = []
 
-        for i in range(count):
+        for i in range(total_jornadas):
 
-            span = all_spans.nth(i)
-
-            title = await span.get_attribute("title")
-
-            if not title:
-                continue
-
-            if clean(title).upper() != TEAM:
-                continue
-
-            # Subimos al contenedor del partido
-            current = span
-
-            row = None
-
-            for _ in range(8):
-
-                current = current.locator("xpath=..")
-
-                titles = current.locator("span[title]")
-
-                n_titles = await titles.count()
-
-                if n_titles == 2:
-                    row = current
-                    break
-
-            if row is None:
-                continue
-
-            titles = row.locator("span[title]")
-
-            teams = []
-
-            for j in range(await titles.count()):
-                t = await titles.nth(j).get_attribute("title")
-
-                if t:
-                    t = clean(t)
-
-                    if t not in teams:
-                        teams.append(t)
-
-            if len(teams) != 2:
-                continue
-
-            local = teams[0]
-            visitante = teams[1]
-
-            matches.append(
-                (local, visitante)
+            # Reobtenemos el locator en cada vuelta porque
+            # React puede modificar el DOM.
+            jornadas = page.get_by_text(
+                re.compile(r"^JORNADA\s+\d+$"),
+                exact=True
             )
 
-        # --------------------------------------------------
-        # QUITAR DUPLICADOS
-        # --------------------------------------------------
+            header = jornadas.nth(i)
 
+            jornada_text = clean(
+                await header.inner_text()
+            )
+
+            print("")
+            print(
+                f"--- Abriendo {jornada_text} "
+                f"({i + 1}/{total_jornadas}) ---"
+            )
+
+            await header.scroll_into_view_if_needed()
+
+            # Buscamos un contenedor superior que también
+            # contenga la fecha de esa jornada.
+            current = header
+            fecha = ""
+
+            for _ in range(6):
+                current = current.locator("xpath=..")
+
+                txt = clean(
+                    await current.inner_text()
+                )
+
+                match_fecha = re.search(
+                    r"\b20\d{2}-\d{2}-\d{2}\b",
+                    txt
+                )
+
+                if match_fecha:
+                    fecha = match_fecha.group(0)
+                    break
+
+            print(f"Fecha detectada: {fecha}")
+
+            # Hacemos clic en la cabecera.
+            try:
+                await header.click()
+            except Exception:
+                await header.click(force=True)
+
+            await page.wait_for_timeout(600)
+
+            # ¿Está el Barça dentro de la jornada abierta?
+            partido = await get_match_from_open_jornada(
+                page,
+                jornada_text,
+                fecha
+            )
+
+            if partido:
+                matches.append(partido)
+
+                print(
+                    "BARÇA: "
+                    f'{partido["local"]} vs '
+                    f'{partido["visitante"]}'
+                )
+
+            else:
+                print("Barça no encontrado en esta jornada.")
+
+        # Eliminar duplicados por jornada
         unique = []
 
         seen = set()
 
         for match in matches:
-
-            key = tuple(match)
+            key = match["jornada"]
 
             if key not in seen:
                 seen.add(key)
                 unique.append(match)
 
+        print("")
+        print("==============================")
         print(
-            f"Partidos del Barça encontrados: "
-            f"{len(unique)}"
+            f"PARTIDOS DEL BARÇA: {len(unique)}"
         )
+        print("==============================")
 
-        for n, (local, visitante) in enumerate(
-            unique,
-            start=1
-        ):
+        for match in unique:
+            print(
+                f'{match["jornada"]} | '
+                f'{match["fecha"]} | '
+                f'{match["local"]} vs '
+                f'{match["visitante"]}'
+            )
 
-            print("")
-            print(f"===== PARTIDO {n} =====")
-            print(f"{local} vs {visitante}")
-
-        # --------------------------------------------------
-        # CREAR ICS BASE
-        # --------------------------------------------------
-
+        # Calendario base
         cal = Calendar()
 
         cal.add(
@@ -179,7 +212,6 @@ async def main():
         )
 
         cal.add("version", "2.0")
-
         cal.add(
             "x-wr-calname",
             "FC Barcelona S11A 26/27"
