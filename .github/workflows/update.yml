@@ -47,7 +47,6 @@ jobs:
         run: |
           mkdir public
           cp barca-s11a.ics public/
-          cp fcf_debug.txt public/
           touch public/.nojekyll
 
       - name: Configurar GitHub Pages
