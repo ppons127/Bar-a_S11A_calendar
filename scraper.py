@@ -1,11 +1,6 @@
 import asyncio
-import re
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-
+from icalendar import Calendar
 from playwright.async_api import async_playwright
-from icalendar import Calendar, Event
-
 
 FCF_URL = (
     "https://www.fcf.cat/ca/competicio"
@@ -17,7 +12,6 @@ FCF_URL = (
 )
 
 TEAM = "BARCELONA, F.C."
-TZ = ZoneInfo("Europe/Madrid")
 
 
 def clean(text):
@@ -29,7 +23,7 @@ async def main():
         browser = await p.chromium.launch(headless=True)
 
         page = await browser.new_page(
-            viewport={"width": 1600, "height": 2000}
+            viewport={"width": 1600, "height": 1200}
         )
 
         print("Abriendo calendario FCF...")
@@ -40,36 +34,57 @@ async def main():
             timeout=90000
         )
 
-        # Esperamos explícitamente a que el calendario
-        # haya renderizado al FC Barcelona.
         await page.wait_for_selector(
             f'span[title="{TEAM}"]',
             timeout=90000
         )
 
-        await page.wait_for_timeout(3000)
-
         print("Calendario cargado.")
 
-        cal = Calendar()
-        cal.add("prodid", "-//FC Barcelona S11A//FCF Calendar//ES")
-        cal.add("version", "2.0")
-        cal.add("x-wr-calname", "FC Barcelona S11A 26/27")
-        cal.add("x-wr-timezone", "Europe/Madrid")
+        # --------------------------------------------------
+        # FORZAR CARGA DE TODO EL CALENDARIO
+        # --------------------------------------------------
 
-        # Buscamos todos los span con nombres de equipos.
-        team_spans = page.locator('span[title]')
+        previous_height = 0
 
-        count = await team_spans.count()
+        for _ in range(30):
+
+            current_height = await page.evaluate(
+                "document.body.scrollHeight"
+            )
+
+            await page.evaluate(
+                "window.scrollTo(0, document.body.scrollHeight)"
+            )
+
+            await page.wait_for_timeout(1200)
+
+            if current_height == previous_height:
+                break
+
+            previous_height = current_height
+
+        # Volvemos arriba
+        await page.evaluate("window.scrollTo(0, 0)")
+        await page.wait_for_timeout(1000)
+
+        print("Scroll completo realizado.")
+
+        # --------------------------------------------------
+        # BUSCAR TODOS LOS PARTIDOS
+        # --------------------------------------------------
+
+        all_spans = page.locator('span[title]')
+
+        count = await all_spans.count()
 
         print(f"Elementos con title encontrados: {count}")
 
         matches = []
 
-        # Buscamos las filas donde aparece Barça.
         for i in range(count):
 
-            span = team_spans.nth(i)
+            span = all_spans.nth(i)
 
             title = await span.get_attribute("title")
 
@@ -79,25 +94,32 @@ async def main():
             if clean(title).upper() != TEAM:
                 continue
 
-            # Subimos hasta encontrar el contenedor de la fila
-            # que contiene exactamente los dos equipos.
-            row = span.locator(
-                "xpath=ancestor::div[contains(@class,'flex') "
-                "and contains(@class,'items-center')]"
-            ).first
+            # Subimos al contenedor del partido
+            current = span
 
-            row_html = await row.evaluate(
-                "(el) => el.outerHTML"
-            )
+            row = None
 
-            # Dentro de esa fila buscamos los nombres de equipos.
-            row_locator = row.locator('span[title]')
-            row_count = await row_locator.count()
+            for _ in range(8):
+
+                current = current.locator("xpath=..")
+
+                titles = current.locator("span[title]")
+
+                n_titles = await titles.count()
+
+                if n_titles == 2:
+                    row = current
+                    break
+
+            if row is None:
+                continue
+
+            titles = row.locator("span[title]")
 
             teams = []
 
-            for j in range(row_count):
-                t = await row_locator.nth(j).get_attribute("title")
+            for j in range(await titles.count()):
+                t = await titles.nth(j).get_attribute("title")
 
                 if t:
                     t = clean(t)
@@ -105,69 +127,63 @@ async def main():
                     if t not in teams:
                         teams.append(t)
 
-            # Buscamos una combinación que contenga al Barça
-            # y exactamente otro equipo.
-            teams = [
-                t for t in teams
-                if len(t) > 2
-            ]
-
-            if TEAM not in teams:
+            if len(teams) != 2:
                 continue
 
-            if len(teams) < 2:
-                continue
-
-            # Nos quedamos con los dos primeros nombres distintos.
             local = teams[0]
             visitante = teams[1]
 
             matches.append(
-                {
-                    "local": local,
-                    "visitante": visitante,
-                    "html": row_html
-                }
+                (local, visitante)
             )
 
-        # Eliminamos duplicados.
+        # --------------------------------------------------
+        # QUITAR DUPLICADOS
+        # --------------------------------------------------
+
         unique = []
 
         seen = set()
 
         for match in matches:
 
-            key = (
-                match["local"],
-                match["visitante"]
-            )
+            key = tuple(match)
 
             if key not in seen:
                 seen.add(key)
                 unique.append(match)
 
-        print(f"Partidos del Barça encontrados: {len(unique)}")
+        print(
+            f"Partidos del Barça encontrados: "
+            f"{len(unique)}"
+        )
 
-        for n, match in enumerate(unique, start=1):
+        for n, (local, visitante) in enumerate(
+            unique,
+            start=1
+        ):
 
             print("")
             print(f"===== PARTIDO {n} =====")
-            print(
-                f'{match["local"]} vs '
-                f'{match["visitante"]}'
-            )
+            print(f"{local} vs {visitante}")
 
-        # -----------------------------------------------------
-        # SEGUNDA PARTE:
-        # fecha + jornada + hora
-        # -----------------------------------------------------
+        # --------------------------------------------------
+        # CREAR ICS BASE
+        # --------------------------------------------------
 
-        # De momento creamos el calendario.
-        # En la siguiente ejecución vamos a comprobar
-        # que los partidos se detectan correctamente.
-        #
-        # Después añadiremos fecha/hora/jornada,
-        # que están en el contenedor superior.
+        cal = Calendar()
+
+        cal.add(
+            "prodid",
+            "-//FC Barcelona S11A//FCF Calendar//ES"
+        )
+
+        cal.add("version", "2.0")
+
+        cal.add(
+            "x-wr-calname",
+            "FC Barcelona S11A 26/27"
+        )
 
         with open("barca-s11a.ics", "wb") as f:
             f.write(cal.to_ical())
