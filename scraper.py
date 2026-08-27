@@ -1,8 +1,15 @@
 import asyncio
 import re
-from icalendar import Calendar
+from datetime import datetime, timedelta, date, timezone
+from zoneinfo import ZoneInfo
+
+from icalendar import Calendar, Event
 from playwright.async_api import async_playwright
 
+
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
 
 FCF_URL = (
     "https://www.fcf.cat/ca/competicio"
@@ -13,15 +20,60 @@ FCF_URL = (
     "&tab=calendari"
 )
 
-TEAM = "BARCELONA, F.C."
+FCF_BASE = "https://www.fcf.cat"
 
+TEAM = "BARCELONA, F.C."
+CALENDAR_NAME = "FC Barcelona S11A 26/27"
+
+TZ = ZoneInfo("Europe/Madrid")
+
+
+# ============================================================
+# FUNCIONES AUXILIARES
+# ============================================================
 
 def clean(text):
     return " ".join(text.split()).strip()
 
 
-async def get_match_from_open_jornada(page, jornada, fecha):
+def jornada_number(jornada):
+    match = re.search(r"(\d+)", jornada)
+
+    if match:
+        return int(match.group(1))
+
+    return 0
+
+
+def pretty_team(team):
+    """
+    Para que en Apple Calendar aparezca 'Barça S11A'
+    en vez de BARCELONA, F.C.
+    """
+    if clean(team).upper() == TEAM:
+        return "Barça S11A"
+
+    return clean(team)
+
+
+def build_summary(local, visitante):
+    local_name = pretty_team(local)
+    visitante_name = pretty_team(visitante)
+
+    return f"⚽ {local_name} - {visitante_name}"
+
+
+# ============================================================
+# EXTRAER PARTIDO DE LA JORNADA ABIERTA
+# ============================================================
+
+async def get_match_from_open_jornada(
+    page,
+    jornada,
+    fecha
+):
     spans = page.locator(f'span[title="{TEAM}"]')
+
     count = await spans.count()
 
     if count == 0:
@@ -32,8 +84,10 @@ async def get_match_from_open_jornada(page, jornada, fecha):
     current = span
     row = None
 
-    # Subimos por el DOM hasta encontrar el contenedor
-    # que tiene exactamente dos nombres de equipo.
+    # --------------------------------------------------------
+    # ENCONTRAR LA FILA LOCAL - VISITANTE
+    # --------------------------------------------------------
+
     for _ in range(10):
         current = current.locator("xpath=..")
 
@@ -52,34 +106,400 @@ async def get_match_from_open_jornada(page, jornada, fecha):
     teams = []
 
     for j in range(await titles.count()):
-        t = await titles.nth(j).get_attribute("title")
+        team_name = await titles.nth(j).get_attribute(
+            "title"
+        )
 
-        if t:
-            t = clean(t)
+        if team_name:
+            team_name = clean(team_name)
 
-            if t not in teams:
-                teams.append(t)
+            if team_name not in teams:
+                teams.append(team_name)
 
     if len(teams) != 2:
         return None
 
+    local = teams[0]
+    visitante = teams[1]
+
+    # --------------------------------------------------------
+    # BUSCAR EL ENLACE DEL ACTA
+    # --------------------------------------------------------
+
+    acta_href = None
+
+    current = row
+
+    for _ in range(8):
+
+        acta_links = current.locator(
+            'a[href*="/ca/competicio/acta/"]'
+        )
+
+        if await acta_links.count() > 0:
+
+            acta_href = await acta_links.first.get_attribute(
+                "href"
+            )
+
+            break
+
+        current = current.locator("xpath=..")
+
+    acta_url = None
+
+    if acta_href:
+
+        if acta_href.startswith("http"):
+            acta_url = acta_href
+
+        else:
+            acta_url = FCF_BASE + acta_href
+
     return {
         "jornada": jornada,
         "fecha": fecha,
-        "local": teams[0],
-        "visitante": teams[1],
+        "local": local,
+        "visitante": visitante,
+        "acta_url": acta_url,
     }
 
 
-async def main():
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+# ============================================================
+# LEER FECHA / HORA / CAMPO DEL ACTA
+# ============================================================
 
-        page = await browser.new_page(
-            viewport={"width": 1600, "height": 1200}
+async def read_acta_details(context, match):
+    """
+    Entra en el acta oficial del partido y busca:
+
+    DATA
+    HORA
+    ESTADI
+
+    Si todavía no están publicados, conserva
+    la fecha general de la jornada.
+    """
+
+    acta_url = match.get("acta_url")
+
+    if not acta_url:
+        print("   Sin enlace de acta.")
+        return match
+
+    acta_page = await context.new_page()
+
+    try:
+
+        await acta_page.goto(
+            acta_url,
+            wait_until="domcontentloaded",
+            timeout=60000
         )
 
-        print("Abriendo calendario FCF...")
+        await acta_page.wait_for_timeout(1200)
+
+        body = clean(
+            await acta_page.locator("body").inner_text()
+        )
+
+        # ----------------------------------------------------
+        # FECHA
+        # ----------------------------------------------------
+
+        date_match = re.search(
+            r"DATA\s*:\s*(\d{1,2}/\d{1,2}/\d{4})",
+            body,
+            flags=re.IGNORECASE
+        )
+
+        if date_match:
+
+            parsed = datetime.strptime(
+                date_match.group(1),
+                "%d/%m/%Y"
+            )
+
+            match["fecha"] = parsed.strftime(
+                "%Y-%m-%d"
+            )
+
+        # ----------------------------------------------------
+        # HORA
+        # ----------------------------------------------------
+
+        time_match = re.search(
+            r"HORA\s*:\s*(\d{1,2}:\d{2})",
+            body,
+            flags=re.IGNORECASE
+        )
+
+        if time_match:
+            match["hora"] = time_match.group(1)
+
+        else:
+            match["hora"] = None
+
+        # ----------------------------------------------------
+        # ESTADIO / CAMPO
+        # ----------------------------------------------------
+
+        stadium_match = re.search(
+            r"ESTADI\s*:\s*(.+?)(?="
+            r"ENTRENADOR|DELEGAT|COORDINADOR|$)",
+            body,
+            flags=re.IGNORECASE
+        )
+
+        if stadium_match:
+
+            stadium = clean(
+                stadium_match.group(1)
+            )
+
+            # Cortamos posibles textos posteriores.
+            for separator in [
+                " TEMPORADA",
+                " DATA:",
+                " HORA:",
+            ]:
+
+                if separator in stadium:
+                    stadium = stadium.split(
+                        separator
+                    )[0]
+
+            match["estadi"] = stadium.strip()
+
+        else:
+            match["estadi"] = None
+
+        print(
+            f'   Hora: {match.get("hora") or "pendiente"}'
+        )
+
+        print(
+            f'   Campo: '
+            f'{match.get("estadi") or "pendiente"}'
+        )
+
+    except Exception as error:
+
+        print(
+            f"   No se pudo leer el acta: {error}"
+        )
+
+        match["hora"] = None
+        match["estadi"] = None
+
+    finally:
+
+        await acta_page.close()
+
+    return match
+
+
+# ============================================================
+# CREAR EVENTO ICS
+# ============================================================
+
+def add_match_to_calendar(cal, match):
+    event = Event()
+
+    jornada_n = jornada_number(
+        match["jornada"]
+    )
+
+    local = match["local"]
+    visitante = match["visitante"]
+
+    summary = build_summary(
+        local,
+        visitante
+    )
+
+    event.add(
+        "summary",
+        summary
+    )
+
+    # --------------------------------------------------------
+    # UID ESTABLE
+    # --------------------------------------------------------
+    #
+    # Esto es MUY importante.
+    #
+    # Aunque la FCF cambie fecha u hora, Apple reconocerá
+    # que sigue siendo el mismo partido y actualizará el
+    # evento en vez de crear otro.
+    # --------------------------------------------------------
+
+    uid = (
+        f"barca-s11a-2627-jornada-"
+        f"{jornada_n:02d}@fcf-calendar"
+    )
+
+    event.add(
+        "uid",
+        uid
+    )
+
+    event.add(
+        "dtstamp",
+        datetime.now(timezone.utc)
+    )
+
+    # --------------------------------------------------------
+    # FECHA
+    # --------------------------------------------------------
+
+    fecha = datetime.strptime(
+        match["fecha"],
+        "%Y-%m-%d"
+    ).date()
+
+    hora = match.get("hora")
+
+    # --------------------------------------------------------
+    # SI HAY HORA CONFIRMADA
+    # --------------------------------------------------------
+
+    if hora:
+
+        hour, minute = map(
+            int,
+            hora.split(":")
+        )
+
+        start = datetime(
+            fecha.year,
+            fecha.month,
+            fecha.day,
+            hour,
+            minute,
+            tzinfo=TZ
+        )
+
+        # Duración visual del evento.
+        # No afecta al horario oficial del partido.
+        end = start + timedelta(
+            hours=1,
+            minutes=30
+        )
+
+        event.add(
+            "dtstart",
+            start
+        )
+
+        event.add(
+            "dtend",
+            end
+        )
+
+    # --------------------------------------------------------
+    # SI TODAVÍA NO HAY HORA
+    # --------------------------------------------------------
+
+    else:
+
+        # Aparece como evento de día completo.
+        event.add(
+            "dtstart",
+            fecha
+        )
+
+        event.add(
+            "dtend",
+            fecha + timedelta(days=1)
+        )
+
+    # --------------------------------------------------------
+    # CAMPO
+    # --------------------------------------------------------
+
+    estadio = match.get("estadi")
+
+    if estadio:
+
+        event.add(
+            "location",
+            estadio
+        )
+
+    # --------------------------------------------------------
+    # DESCRIPCIÓN
+    # --------------------------------------------------------
+
+    lines = [
+        "FC Barcelona S11A",
+        "Preferent Aleví S11 - Grup 4",
+        match["jornada"],
+        "",
+        f'Local: {pretty_team(local)}',
+        f'Visitante: {pretty_team(visitante)}',
+    ]
+
+    if hora:
+        lines.append(
+            f"Hora FCF: {hora}"
+        )
+
+    else:
+        lines.append(
+            "Hora pendiente de confirmar por la FCF"
+        )
+
+    if estadio:
+        lines.append(
+            f"Camp: {estadio}"
+        )
+
+    if match.get("acta_url"):
+
+        lines.extend([
+            "",
+            "Acta oficial FCF:",
+            match["acta_url"],
+        ])
+
+        event.add(
+            "url",
+            match["acta_url"]
+        )
+
+    event.add(
+        "description",
+        "\n".join(lines)
+    )
+
+    cal.add_component(event)
+
+
+# ============================================================
+# PROGRAMA PRINCIPAL
+# ============================================================
+
+async def main():
+
+    async with async_playwright() as p:
+
+        browser = await p.chromium.launch(
+            headless=True
+        )
+
+        context = await browser.new_context(
+            viewport={
+                "width": 1600,
+                "height": 1200
+            }
+        )
+
+        page = await context.new_page()
+
+        print(
+            "Abriendo calendario FCF..."
+        )
 
         await page.goto(
             FCF_URL,
@@ -89,33 +509,42 @@ async def main():
 
         await page.wait_for_timeout(4000)
 
-        print("Calendario cargado.")
+        print(
+            "Calendario cargado."
+        )
 
-        # --------------------------------------------------
-        # BUSCAR TODAS LAS JORNADAS
-        # --------------------------------------------------
+        # ====================================================
+        # LOCALIZAR JORNADAS
+        # ====================================================
 
         jornadas = page.get_by_text(
-            re.compile(r"^JORNADA\s+\d+$"),
+            re.compile(
+                r"^JORNADA\s+\d+$"
+            ),
             exact=True
         )
 
         total_jornadas = await jornadas.count()
 
-        print(f"Jornadas encontradas: {total_jornadas}")
+        print(
+            f"Jornadas encontradas: "
+            f"{total_jornadas}"
+        )
 
         matches = []
 
-        # --------------------------------------------------
+        # ====================================================
         # RECORRER JORNADA POR JORNADA
-        # --------------------------------------------------
+        # ====================================================
 
-        for i in range(total_jornadas):
+        for i in range(
+            total_jornadas
+        ):
 
-            # React puede modificar el DOM, así que
-            # recuperamos los locators en cada vuelta.
             jornadas = page.get_by_text(
-                re.compile(r"^JORNADA\s+\d+$"),
+                re.compile(
+                    r"^JORNADA\s+\d+$"
+                ),
                 exact=True
             )
 
@@ -127,21 +556,24 @@ async def main():
 
             print("")
             print(
-                f"--- Abriendo {jornada_text} "
+                f"--- {jornada_text} "
                 f"({i + 1}/{total_jornadas}) ---"
             )
 
             await header.scroll_into_view_if_needed()
 
-            # --------------------------------------------------
-            # DETECTAR FECHA
-            # --------------------------------------------------
+            # -----------------------------------------------
+            # FECHA GENERAL DE LA JORNADA
+            # -----------------------------------------------
 
             current = header
             fecha = ""
 
             for _ in range(6):
-                current = current.locator("xpath=..")
+
+                current = current.locator(
+                    "xpath=.."
+                )
 
                 txt = clean(
                     await current.inner_text()
@@ -153,41 +585,56 @@ async def main():
                 )
 
                 if match_fecha:
-                    fecha = match_fecha.group(0)
+
+                    fecha = match_fecha.group(
+                        0
+                    )
+
                     break
 
-            print(f"Fecha detectada: {fecha}")
+            print(
+                f"Fecha jornada: {fecha}"
+            )
 
-            # --------------------------------------------------
-            # ABRIR JORNADA
-            # --------------------------------------------------
+            # -----------------------------------------------
+            # ABRIR ACORDEÓN
+            # -----------------------------------------------
 
-            # La Jornada 1 ya viene abierta por defecto.
-            # Por eso NO hacemos clic en ella.
-            #
-            # A partir de la Jornada 2 sí hacemos clic
-            # para abrir el acordeón correspondiente.
+            # Jornada 1 ya viene abierta.
 
             if i > 0:
+
                 try:
+
                     await header.click()
+
                 except Exception:
-                    await header.click(force=True)
 
-                await page.wait_for_timeout(600)
+                    await header.click(
+                        force=True
+                    )
 
-            # --------------------------------------------------
-            # BUSCAR PARTIDO DEL BARÇA
-            # --------------------------------------------------
+                await page.wait_for_timeout(
+                    500
+                )
 
-            partido = await get_match_from_open_jornada(
-                page,
-                jornada_text,
-                fecha
+            # -----------------------------------------------
+            # LOCALIZAR PARTIDO DEL BARÇA
+            # -----------------------------------------------
+
+            partido = (
+                await get_match_from_open_jornada(
+                    page,
+                    jornada_text,
+                    fecha
+                )
             )
 
             if partido:
-                matches.append(partido)
+
+                matches.append(
+                    partido
+                )
 
                 print(
                     "BARÇA: "
@@ -195,47 +642,93 @@ async def main():
                     f'{partido["visitante"]}'
                 )
 
-            else:
                 print(
-                    "Barça no encontrado en esta jornada."
+                    "Acta: "
+                    f'{partido["acta_url"]}'
                 )
 
-        # --------------------------------------------------
-        # ELIMINAR POSIBLES DUPLICADOS
-        # --------------------------------------------------
+            else:
+
+                print(
+                    "Barça no encontrado."
+                )
+
+        # ====================================================
+        # ELIMINAR DUPLICADOS
+        # ====================================================
 
         unique = []
         seen = set()
 
         for match in matches:
-            key = match["jornada"]
 
-            if key not in seen:
-                seen.add(key)
-                unique.append(match)
-
-        # --------------------------------------------------
-        # MOSTRAR RESULTADO
-        # --------------------------------------------------
-
-        print("")
-        print("==============================")
-        print(
-            f"PARTIDOS DEL BARÇA: {len(unique)}"
-        )
-        print("==============================")
-
-        for match in unique:
-            print(
-                f'{match["jornada"]} | '
-                f'{match["fecha"]} | '
-                f'{match["local"]} vs '
-                f'{match["visitante"]}'
+            key = jornada_number(
+                match["jornada"]
             )
 
-        # --------------------------------------------------
-        # CREAR ARCHIVO ICS BASE
-        # --------------------------------------------------
+            if key not in seen:
+
+                seen.add(key)
+                unique.append(
+                    match
+                )
+
+        unique.sort(
+            key=lambda x: jornada_number(
+                x["jornada"]
+            )
+        )
+
+        print("")
+        print(
+            "=============================="
+        )
+
+        print(
+            f"PARTIDOS DEL BARÇA: "
+            f"{len(unique)}"
+        )
+
+        print(
+            "=============================="
+        )
+
+        # ====================================================
+        # LEER ACTAS
+        # ====================================================
+
+        print("")
+        print(
+            "Leyendo horarios y campos..."
+        )
+
+        detailed_matches = []
+
+        for index, match in enumerate(
+            unique,
+            start=1
+        ):
+
+            print("")
+            print(
+                f'[{index}/{len(unique)}] '
+                f'{match["jornada"]}'
+            )
+
+            detailed = (
+                await read_acta_details(
+                    context,
+                    match
+                )
+            )
+
+            detailed_matches.append(
+                detailed
+            )
+
+        # ====================================================
+        # CREAR CALENDARIO
+        # ====================================================
 
         cal = Calendar()
 
@@ -244,18 +737,90 @@ async def main():
             "-//FC Barcelona S11A//FCF Calendar//ES"
         )
 
-        cal.add("version", "2.0")
+        cal.add(
+            "version",
+            "2.0"
+        )
+
+        cal.add(
+            "calscale",
+            "GREGORIAN"
+        )
+
+        cal.add(
+            "method",
+            "PUBLISH"
+        )
 
         cal.add(
             "x-wr-calname",
-            "FC Barcelona S11A 26/27"
+            CALENDAR_NAME
         )
 
-        with open("barca-s11a.ics", "wb") as f:
-            f.write(cal.to_ical())
+        cal.add(
+            "x-wr-timezone",
+            "Europe/Madrid"
+        )
+
+        cal.add(
+            "x-wr-caldesc",
+            "Calendari automàtic FC Barcelona S11A - FCF"
+        )
+
+        # ====================================================
+        # AÑADIR PARTIDOS
+        # ====================================================
+
+        for match in detailed_matches:
+
+            if not match.get("fecha"):
+
+                print(
+                    "Partido sin fecha, "
+                    "no se añade:"
+                )
+
+                print(
+                    match["jornada"]
+                )
+
+                continue
+
+            add_match_to_calendar(
+                cal,
+                match
+            )
+
+        # ====================================================
+        # GUARDAR
+        # ====================================================
+
+        with open(
+            "barca-s11a.ics",
+            "wb"
+        ) as f:
+
+            f.write(
+                cal.to_ical()
+            )
 
         print("")
-        print("Calendario base generado.")
+        print(
+            "================================"
+        )
+
+        print(
+            "CALENDARIO ICS GENERADO"
+        )
+
+        print(
+            f"Eventos: "
+            f"{len(detailed_matches)}"
+        )
+
+        print(
+            "================================"
+        )
 
         await browser.close()
 
