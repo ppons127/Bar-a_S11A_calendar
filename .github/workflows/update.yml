@@ -1,0 +1,63 @@
+name: Actualizar calendario Barça S11A
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "0 */6 * * *"
+
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+
+  generate:
+
+    runs-on: ubuntu-latest
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+
+      - name: Descargar repositorio
+        uses: actions/checkout@v6
+
+      - name: Instalar Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Leer FCF y crear calendario
+        run: python scraper.py
+
+      - name: Preparar web
+        run: |
+          mkdir public
+          cp barca-s11a.ics public/
+          cp fcf_debug.txt public/
+          touch public/.nojekyll
+
+      - name: Configurar GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Subir calendario
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: public
+
+      - name: Publicar calendario
+        id: deployment
+        uses: actions/deploy-pages@v4
