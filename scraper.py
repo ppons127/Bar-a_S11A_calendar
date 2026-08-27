@@ -91,7 +91,10 @@ async def main():
 
         print("Calendario cargado.")
 
-        # Buscamos todos los encabezados "JORNADA X"
+        # --------------------------------------------------
+        # BUSCAR TODAS LAS JORNADAS
+        # --------------------------------------------------
+
         jornadas = page.get_by_text(
             re.compile(r"^JORNADA\s+\d+$"),
             exact=True
@@ -103,10 +106,14 @@ async def main():
 
         matches = []
 
+        # --------------------------------------------------
+        # RECORRER JORNADA POR JORNADA
+        # --------------------------------------------------
+
         for i in range(total_jornadas):
 
-            # Reobtenemos el locator en cada vuelta porque
-            # React puede modificar el DOM.
+            # React puede modificar el DOM, así que
+            # recuperamos los locators en cada vuelta.
             jornadas = page.get_by_text(
                 re.compile(r"^JORNADA\s+\d+$"),
                 exact=True
@@ -126,8 +133,10 @@ async def main():
 
             await header.scroll_into_view_if_needed()
 
-            # Buscamos un contenedor superior que también
-            # contenga la fecha de esa jornada.
+            # --------------------------------------------------
+            # DETECTAR FECHA
+            # --------------------------------------------------
+
             current = header
             fecha = ""
 
@@ -149,15 +158,28 @@ async def main():
 
             print(f"Fecha detectada: {fecha}")
 
-            # Hacemos clic en la cabecera.
-            try:
-                await header.click()
-            except Exception:
-                await header.click(force=True)
+            # --------------------------------------------------
+            # ABRIR JORNADA
+            # --------------------------------------------------
 
-            await page.wait_for_timeout(600)
+            # La Jornada 1 ya viene abierta por defecto.
+            # Por eso NO hacemos clic en ella.
+            #
+            # A partir de la Jornada 2 sí hacemos clic
+            # para abrir el acordeón correspondiente.
 
-            # ¿Está el Barça dentro de la jornada abierta?
+            if i > 0:
+                try:
+                    await header.click()
+                except Exception:
+                    await header.click(force=True)
+
+                await page.wait_for_timeout(600)
+
+            # --------------------------------------------------
+            # BUSCAR PARTIDO DEL BARÇA
+            # --------------------------------------------------
+
             partido = await get_match_from_open_jornada(
                 page,
                 jornada_text,
@@ -174,11 +196,15 @@ async def main():
                 )
 
             else:
-                print("Barça no encontrado en esta jornada.")
+                print(
+                    "Barça no encontrado en esta jornada."
+                )
 
-        # Eliminar duplicados por jornada
+        # --------------------------------------------------
+        # ELIMINAR POSIBLES DUPLICADOS
+        # --------------------------------------------------
+
         unique = []
-
         seen = set()
 
         for match in matches:
@@ -187,6 +213,10 @@ async def main():
             if key not in seen:
                 seen.add(key)
                 unique.append(match)
+
+        # --------------------------------------------------
+        # MOSTRAR RESULTADO
+        # --------------------------------------------------
 
         print("")
         print("==============================")
@@ -203,7 +233,10 @@ async def main():
                 f'{match["visitante"]}'
             )
 
-        # Calendario base
+        # --------------------------------------------------
+        # CREAR ARCHIVO ICS BASE
+        # --------------------------------------------------
+
         cal = Calendar()
 
         cal.add(
@@ -212,6 +245,7 @@ async def main():
         )
 
         cal.add("version", "2.0")
+
         cal.add(
             "x-wr-calname",
             "FC Barcelona S11A 26/27"
