@@ -16,99 +16,164 @@ FCF_URL = (
     "&tab=calendari"
 )
 
-TEAM_NAMES = [
-    "BARCELONA, F.C. A",
-    "BARCELONA F.C. A",
-    "FC BARCELONA A",
-    "BARCELONA, FC A",
-]
-
+TEAM = "BARCELONA, F.C."
 TZ = ZoneInfo("Europe/Madrid")
 
 
+def clean(text):
+    return " ".join(text.split()).strip()
+
+
 async def main():
-
     async with async_playwright() as p:
-
         browser = await p.chromium.launch(headless=True)
 
         page = await browser.new_page(
-            viewport={"width": 1600, "height": 1200}
+            viewport={"width": 1600, "height": 2000}
         )
 
-        print("Abriendo FCF...")
+        print("Abriendo calendario FCF...")
+
         await page.goto(
             FCF_URL,
-            wait_until="networkidle",
+            wait_until="domcontentloaded",
             timeout=90000
         )
 
-        await page.wait_for_timeout(5000)
+        # Esperamos explícitamente a que el calendario
+        # haya renderizado al FC Barcelona.
+        await page.wait_for_selector(
+            f'span[title="{TEAM}"]',
+            timeout=90000
+        )
 
-        body_text = await page.locator("body").inner_text()
+        await page.wait_for_timeout(3000)
 
-        print("Página cargada.")
-        print("--------------------------------")
-        print(body_text[:15000])
-        print("--------------------------------")
-
-        # Guardamos todo el texto para poder revisar
-        # fácilmente la primera ejecución.
-        with open("fcf_debug.txt", "w", encoding="utf-8") as f:
-            f.write(body_text)
-
-        lines = [
-            line.strip()
-            for line in body_text.splitlines()
-            if line.strip()
-        ]
+        print("Calendario cargado.")
 
         cal = Calendar()
-
         cal.add("prodid", "-//FC Barcelona S11A//FCF Calendar//ES")
         cal.add("version", "2.0")
         cal.add("x-wr-calname", "FC Barcelona S11A 26/27")
         cal.add("x-wr-timezone", "Europe/Madrid")
 
-        team_matches = []
+        # Buscamos todos los span con nombres de equipos.
+        team_spans = page.locator('span[title]')
 
-        for i, line in enumerate(lines):
+        count = await team_spans.count()
 
-            if any(team.lower() in line.lower() for team in TEAM_NAMES):
+        print(f"Elementos con title encontrados: {count}")
 
-                start = max(0, i - 15)
-                end = min(len(lines), i + 16)
+        matches = []
 
-                block = lines[start:end]
+        # Buscamos las filas donde aparece Barça.
+        for i in range(count):
 
-                team_matches.append(block)
+            span = team_spans.nth(i)
 
-        print(
-            f"Bloques encontrados relacionados con Barça: "
-            f"{len(team_matches)}"
-        )
+            title = await span.get_attribute("title")
 
-        # Primera versión diagnóstica.
+            if not title:
+                continue
+
+            if clean(title).upper() != TEAM:
+                continue
+
+            # Subimos hasta encontrar el contenedor de la fila
+            # que contiene exactamente los dos equipos.
+            row = span.locator(
+                "xpath=ancestor::div[contains(@class,'flex') "
+                "and contains(@class,'items-center')]"
+            ).first
+
+            row_html = await row.evaluate(
+                "(el) => el.outerHTML"
+            )
+
+            # Dentro de esa fila buscamos los nombres de equipos.
+            row_locator = row.locator('span[title]')
+            row_count = await row_locator.count()
+
+            teams = []
+
+            for j in range(row_count):
+                t = await row_locator.nth(j).get_attribute("title")
+
+                if t:
+                    t = clean(t)
+
+                    if t not in teams:
+                        teams.append(t)
+
+            # Buscamos una combinación que contenga al Barça
+            # y exactamente otro equipo.
+            teams = [
+                t for t in teams
+                if len(t) > 2
+            ]
+
+            if TEAM not in teams:
+                continue
+
+            if len(teams) < 2:
+                continue
+
+            # Nos quedamos con los dos primeros nombres distintos.
+            local = teams[0]
+            visitante = teams[1]
+
+            matches.append(
+                {
+                    "local": local,
+                    "visitante": visitante,
+                    "html": row_html
+                }
+            )
+
+        # Eliminamos duplicados.
+        unique = []
+
+        seen = set()
+
+        for match in matches:
+
+            key = (
+                match["local"],
+                match["visitante"]
+            )
+
+            if key not in seen:
+                seen.add(key)
+                unique.append(match)
+
+        print(f"Partidos del Barça encontrados: {len(unique)}")
+
+        for n, match in enumerate(unique, start=1):
+
+            print("")
+            print(f"===== PARTIDO {n} =====")
+            print(
+                f'{match["local"]} vs '
+                f'{match["visitante"]}'
+            )
+
+        # -----------------------------------------------------
+        # SEGUNDA PARTE:
+        # fecha + jornada + hora
+        # -----------------------------------------------------
+
+        # De momento creamos el calendario.
+        # En la siguiente ejecución vamos a comprobar
+        # que los partidos se detectan correctamente.
         #
-        # En la primera ejecución veremos exactamente cómo devuelve
-        # la FCF cada partido y ajustaremos automáticamente/parsing
-        # en función de ese formato.
-        #
-        # Creamos un ICS válido aunque todavía no haya eventos,
-        # para poder comprobar toda la infraestructura.
+        # Después añadiremos fecha/hora/jornada,
+        # que están en el contenedor superior.
 
         with open("barca-s11a.ics", "wb") as f:
             f.write(cal.to_ical())
 
-        print("Calendario generado: barca-s11a.ics")
-
-        for n, block in enumerate(team_matches, start=1):
-
-            print("")
-            print(f"===== PARTIDO/BLOQUE {n} =====")
-
-            for line in block:
-                print(line)
+        print("")
+        print("Calendario base generado.")
 
         await browser.close()
 
